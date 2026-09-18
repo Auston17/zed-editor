@@ -36,7 +36,7 @@ use project::{
 };
 use rope::Point;
 use settings::Settings;
-use std::{cmp::min, fmt::Write, ops::Range, rc::Rc, sync::Arc};
+use std::{cmp::min, fmt::Write, io::Cursor, ops::Range, rc::Rc, sync::Arc};
 use text::LineEnding;
 use theme_settings::ThemeSettings;
 use ui::{ContextMenu, prelude::*};
@@ -2092,7 +2092,7 @@ fn build_chunks_from_creases(
         if crease_range.start.0 > ix {
             chunks.push(text[ix..crease_range.start.0].into());
         }
-        chunks.push(mention_to_content_block(
+        chunks.extend(mention_to_content_blocks(
             &uri,
             mention.as_ref(),
             supports_embedded_context,
@@ -2135,19 +2135,19 @@ fn image_preview_task_for_mention(
     )
 }
 
-fn mention_to_content_block(
+fn mention_to_content_blocks(
     uri: &MentionUri,
     mention: Option<&Mention>,
     supports_embedded_context: bool,
     tracked_buffers: &mut Vec<Entity<Buffer>>,
-) -> acp::ContentBlock {
+) -> Vec<acp::ContentBlock> {
     match mention {
         Some(Mention::Text {
             content,
             tracked_buffers: mention_tracked_buffers,
         }) => {
             tracked_buffers.extend(mention_tracked_buffers.iter().cloned());
-            if supports_embedded_context {
+            vec![if supports_embedded_context {
                 acp::ContentBlock::Resource(acp::EmbeddedResource::new(
                     acp::EmbeddedResourceResource::TextResourceContents(
                         acp::TextResourceContents::new(content.clone(), uri.to_uri().to_string()),
@@ -2158,25 +2158,78 @@ fn mention_to_content_block(
                     uri.name(),
                     uri.to_uri().to_string(),
                 ))
-            }
+            }]
         }
-        Some(Mention::Image(mention_image)) => acp::ContentBlock::Image(
-            acp::ImageContent::new(mention_image.data.clone(), mention_image.format.mime_type())
-                .uri(match uri {
-                    MentionUri::File { .. } | MentionUri::PastedImage { .. } => {
-                        Some(uri.to_uri().to_string())
-                    }
-                    other => {
-                        debug_panic!("unexpected mention uri for image: {:?}", other);
-                        None
-                    }
-                }),
-        ),
-        _ => acp::ContentBlock::ResourceLink(acp::ResourceLink::new(
+        Some(Mention::Image(mention_image)) => {
+            let image = acp::ContentBlock::Image(
+                acp::ImageContent::new(mention_image.data.clone(), mention_image.format.mime_type())
+                    .uri(match uri {
+                        MentionUri::File { .. } | MentionUri::PastedImage { .. } => {
+                            Some(uri.to_uri().to_string())
+                        }
+                        other => {
+                            debug_panic!("unexpected mention uri for image: {:?}", other);
+                            None
+                        }
+                    }),
+            );
+
+            let Some(metadata) = image_metadata_text(uri, mention_image) else {
+                return vec![image];
+            };
+
+            vec![acp::ContentBlock::Text(acp::TextContent::new(metadata)), image]
+        }
+        _ => vec![acp::ContentBlock::ResourceLink(acp::ResourceLink::new(
             uri.name(),
             uri.to_uri().to_string(),
-        )),
+        ))],
     }
+}
+
+fn image_metadata_text(uri: &MentionUri, image: &MentionImage) -> Option<String> {
+    if let Some(metadata) = &image.metadata {
+        return Some(metadata.to_string());
+    }
+
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(image.data.as_bytes())
+        .ok()?;
+    let dimensions = image::ImageReader::new(Cursor::new(&bytes))
+        .with_guessed_format()
+        .ok()
+        .and_then(|reader| reader.into_dimensions().ok());
+
+    let (path, filename) = match uri {
+        MentionUri::File { abs_path } => (
+            Some(abs_path.display().to_string()),
+            abs_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(str::to_owned),
+        ),
+        MentionUri::PastedImage { name } => (None, Some(name.clone())),
+        _ => (None, None),
+    };
+
+    let mut metadata = String::from("<image_metadata>\n");
+    if let Some(path) = path {
+        metadata.push_str(&format!("path: {path}\n"));
+    }
+    if let Some(filename) = filename {
+        metadata.push_str(&format!("filename: {filename}\n"));
+    }
+    if let Some((width, height)) = dimensions {
+        metadata.push_str(&format!("dimensions: {width}x{height}\n"));
+    }
+    metadata.push_str(&format!(
+        "format: {}\nmime_type: {}\nsize_bytes: {}\n</image_metadata>",
+        image.format.mime_type().strip_prefix("image/").unwrap_or(image.format.mime_type()),
+        image.format.mime_type(),
+        bytes.len()
+    ));
+
+    Some(metadata)
 }
 
 /// Parses markdown mention links in the format `[@name](uri)` from text.
@@ -2281,6 +2334,42 @@ mod tests {
             Mention, MessageEditor, MessageEditorEvent, SessionCapabilities, parse_mention_links,
         },
     };
+
+    #[test]
+    fn test_image_metadata_content_block_includes_file_path_and_dimensions() {
+        use acp_thread::MentionUri;
+        use base64::Engine as _;
+
+        let png_bytes = base64::prelude::BASE64_STANDARD
+            .decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==")
+            .unwrap();
+        let image = MentionImage {
+            data: base64::prelude::BASE64_STANDARD.encode(&png_bytes).into(),
+            format: ImageFormat::Png,
+        };
+        let uri = MentionUri::File {
+            abs_path: PathBuf::from("/project/assets/robot.png"),
+        };
+
+        let blocks = mention_to_content_blocks(
+            &uri,
+            Some(&Mention::Image(image)),
+            false,
+            &mut Vec::new(),
+        );
+
+        assert_eq!(blocks.len(), 2);
+        match &blocks[0] {
+            acp::ContentBlock::Text(text) => {
+                assert!(text.text.contains("path: /project/assets/robot.png"));
+                assert!(text.text.contains("dimensions: 1x1"));
+                assert!(text.text.contains("format: png"));
+                assert!(text.text.contains("mime_type: image/png"));
+            }
+            block => panic!("expected image metadata text block, got {block:?}"),
+        }
+        assert!(matches!(blocks[1], acp::ContentBlock::Image(_)));
+    }
 
     #[test]
     fn test_session_capabilities_keep_commands_and_skills_separate() {
